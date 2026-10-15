@@ -11,13 +11,39 @@ import { ControlResult, Transport, TransportStatus } from './types';
 const CONTROL_TIMEOUT_MS = 8000;
 
 /**
- * 连接中断后的界面文案。本扩展**不做任何自动重连**：无论哪种失败都停在离线态，
- * 由用户点「重试连接」再次尝试，避免配置错误时无限制地向中继发起连接。
+ * 断开后的自愈策略：中继重启、网络抖动、Cloudflare 隧道掉线这类瞬时中断自动重连，
+ * 退避从 1s 起指数增长到 30s（带 ±20% 抖动，避免一堆客户端同时回来打爆中继）；
+ * 只有"配置 / 权限 / 版本"这类重连也不会成功的关闭码才停在离线态，等用户处理。
+ * 手动点「断开连接」会停掉重连计划（running=false），不会自己连回来。
  */
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+const RECONNECT_JITTER = 0.2;
+/** 会话稳定存活超过这个时长后再断开时，退避计数清零（链路一直抖时不会反复从 1s 重试） */
+const RECONNECT_STABLE_MS = 60000;
+/** 重连也没用的关闭码：令牌不对 / 没声明 id / id 用保留地址 / 被管理员踢出或封禁 / 版本门禁 */
+const FATAL_CLOSE_CODES = new Set([4001, 4002, 4003, 4006, 4007, 4008]);
+/** 看门狗：中继每 30s 心跳一次，这么久一个帧都没收到就认为本机侧链路已死，主动断开重连 */
+const STALE_FRAME_MS = 95000;
+const WATCHDOG_TICK_MS = 10000;
 const CLOSE_REASON_TEXT: Record<number, string> = {
+  1000: '连接被对端正常关闭',
+  1001: '中继服务正在关闭或重启',
+  1002: 'WebSocket 协议错误，连接被关闭',
+  1003: '中继不接受收到的数据类型',
+  1007: '消息不是合法的 UTF-8 文本，连接被关闭',
+  1008: '消息违反中继策略，连接被关闭',
+  1009: '单条消息超过中继上限（2 MiB），连接被关闭',
+  1010: '本机与中继的扩展协商项不一致，连接被关闭',
+  1011: '中继判定本机心跳超时（长时间没有回应 ping），已重置连接',
+  1012: '中继服务正在重启',
+  1013: '中继暂时不可用（维护或过载）',
+  1014: '中继繁忙，本次连接被拒绝',
+  1015: 'TLS 握手失败（证书不受信任或加密套件不匹配）',
   4001: '中继令牌不正确，请修改令牌后点「保存并应用」',
   4002: '未向中继声明本机 id，请填写档案 id 后点「保存并应用」',
-  4005: '该中继 id 已被另一个窗口占用（若确认旧窗口已关闭，可点「重试连接」）',
+  4003: '档案 id 用了中继的保留地址（server），请换一个 id 后点「保存并应用」',
+  4005: '该中继 id 已被另一个窗口占用（旧窗口关闭后本窗口会自动接上）',
   4006: '已被管理员移出中继（需联系管理员恢复，之后点「重试连接」）',
   4007: '已被管理员封禁（解封后点「重试连接」）',
   4008: '扩展版本未通过中继版本门禁，需与中继同步升级',
@@ -35,6 +61,12 @@ export class RelayTransport implements Transport {
   private ws?: WebSocket;
   private queue: MessageEnvelope[] = [];
   private running = false;
+  /** 待执行的重连定时器（手动断开 / 重新连接时取消） */
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** 已连续重连次数：连接稳定存活后清零，用于指数退避与界面提示 */
+  private reconnectAttempt = 0;
+  /** 看门狗定时器：本机侧长时间收不到任何帧时判定连接已死 */
+  private watchdogTimer?: ReturnType<typeof setInterval>;
   private token = '';
   /** 中继管理令牌（可选）：随握手上报，通过即获得管理权限 */
   private adminToken = '';
@@ -48,17 +80,22 @@ export class RelayTransport implements Transport {
 
   async start(): Promise<void> {
     this.running = true;
+    // 上一轮留下的重连计划作废：本次 start 自己会发起连接
+    this.cancelReconnect();
+    this.reconnectAttempt = 0;
     // 先把旧版全局令牌认领到当前中继名下（地址是这里才保证有值的）
     await this.store.migrateLegacySecrets();
     this.token = await this.store.getToken();
     this.adminToken = await this.store.getAdminToken();
     log(`[relay] 启动：地址=${this.store.config.relay.url || '(空)'} 档案id=${this.store.config.identity.id || '(空)'} 令牌=${this.token ? '已设置' : '未设置'} 扩展版本=${this.store.extensionVersion || '(未知)'}${this.adminToken ? ' 管理令牌=已设置' : ''}`);
-    this.connect();
+    void this.connect().catch(err => logError('[relay] 连接失败', err));
   }
 
   async stop(): Promise<void> {
     log('[relay] 停止');
     this.running = false;
+    this.cancelReconnect();
+    this.stopWatchdog();
     this.ws?.close();
     this.ws = undefined;
     // 保留 queue：断开后重新连接时会补发，用户不会因为断开而丢消息；
@@ -183,6 +220,8 @@ export class RelayTransport implements Transport {
     if (!this.running) {
       return;
     }
+    // 本次是实际发起连接：把待执行的重连计划作废，避免重复连
+    this.cancelReconnect();
     const { url } = this.store.config.relay;
     const myId = this.myRelayId();
     if (!url || !myId) {
@@ -191,7 +230,10 @@ export class RelayTransport implements Transport {
       this.statusEmitter.fire({ state: 'offline', detail: `未配置${missing}，请填写后点「保存并应用」` });
       return;
     }
-    this.statusEmitter.fire({ state: 'connecting', detail: '正在连接中继服务器...' });
+    this.statusEmitter.fire({
+      state: 'connecting',
+      detail: this.reconnectAttempt > 0 ? `正在重连中继服务器（第 ${this.reconnectAttempt} 次重连）...` : '正在连接中继服务器...',
+    });
     if (await this.idTakenOnRelay(url, myId)) {
       // 在线名单里有本机 id：可能是断电遗留的死连接（服务端会接管），也可能是另一窗口。
       // 不再直接放弃连接，交给服务端裁决：死连接被接管，活连接则仍以 4005 拒绝。
@@ -223,8 +265,38 @@ export class RelayTransport implements Transport {
       return;
     }
     this.ws = ws;
+    // 诊断统计：断线时把"存活多久、心跳是否正常"一并写进日志，便于事后判断断在哪一段
+    const stats = { startedAt: Date.now(), opened: false, pings: 0, lastPingAt: 0, lastFrameAt: Date.now() };
+    let lastError = '';
+    ws.on('ping', () => {
+      stats.pings += 1;
+      stats.lastPingAt = Date.now();
+      stats.lastFrameAt = Date.now();
+      // 每 10 次（中继 30s 一轮，约 5 分钟）记一条，避免日志刷屏
+      if (stats.pings % 10 === 0) {
+        log(`[relay] 心跳正常：已连接 ${((Date.now() - stats.startedAt) / 60000).toFixed(1)} 分钟，收到 ping ${stats.pings} 次`);
+      }
+    });
+    // 看门狗：写入侧的失败要等 TCP 超时才发现，这里用"中继心跳是否还在到达"判断本机侧链路是否已死
+    this.stopWatchdog();
+    this.watchdogTimer = setInterval(() => {
+      if (this.ws !== ws) {
+        this.stopWatchdog();
+        return;
+      }
+      if (ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const idleMs = Date.now() - stats.lastFrameAt;
+      if (idleMs >= STALE_FRAME_MS) {
+        log(`[relay] ${Math.round(idleMs / 1000)}s 未收到中继任何帧（心跳应每 30s 一次），判定连接已失效，主动断开后重连`);
+        // terminate 会触发本地的 close(1006)，随后走自动重连
+        ws.terminate();
+      }
+    }, WATCHDOG_TICK_MS);
     ws.on('open', () => {
-      log('[relay] 已连接中继服务器');
+      stats.opened = true;
+      log(this.reconnectAttempt > 0 ? `[relay] 自动重连成功（第 ${this.reconnectAttempt} 次重连）` : '[relay] 已连接中继服务器');
       this.statusEmitter.fire({ state: 'online', detail: '已连接中继服务器' });
       this.fetchRelayInfo(url);
       const identity = this.store.config.identity;
@@ -241,8 +313,12 @@ export class RelayTransport implements Transport {
         ws.send(JSON.stringify(env));
       }
     });
-    ws.on('message', data => this.handleRaw(data));
+    ws.on('message', data => {
+      stats.lastFrameAt = Date.now();
+      this.handleRaw(data);
+    });
     ws.on('error', err => {
+      lastError = err instanceof Error ? err.message : String(err);
       logError('[relay] 连接出错', err);
     });
     ws.on('close', (code, reason) => {
@@ -252,33 +328,90 @@ export class RelayTransport implements Transport {
         return;
       }
       this.ws = undefined;
+      this.stopWatchdog();
       const reasonText = reason.toString();
-      log(`[relay] 与中继的连接关闭：code=${code} reason=${reasonText || '(空)'}`);
+      const aliveMs = Date.now() - stats.startedAt;
+      const ago = (t: number): string => (t > 0 ? `${Math.round((Date.now() - t) / 1000)}s 前` : '从未');
+      log(`[relay] 与中继的连接关闭：code=${code} reason=${reasonText || '(空)'}`
+        + `（本次存活 ${Math.round(aliveMs / 1000)}s，收到 ping ${stats.pings} 次，`
+        + `最后一次 ping ${ago(stats.lastPingAt)}，最后一次数据 ${ago(stats.lastFrameAt)}`
+        + `${lastError ? `，本地错误 ${lastError}` : ''}）`);
       // 授权名单由中继权威下发且"断线即收回"：断开后本机不能继续按旧名单声称对方已授权
       this.store.setGrantedBy([]);
       this.failPending('与中继的连接已断开');
       if (!this.running) {
         return;
       }
-      // 不自动重连：任何中断都停在离线态，文案里写明用户下一步要做什么
-      this.statusEmitter.fire({ state: 'offline', detail: this.describeClose(code, reasonText) });
+      const detail = this.describeClose(code, reasonText, stats.opened, lastError);
+      if (FATAL_CLOSE_CODES.has(code)) {
+        // 令牌 / id / 权限 / 版本问题：重连也不会成功，停在离线态等用户处理
+        log(`[relay] 关闭码 ${code} 属于需要人工处理的情况，不自动重连`);
+        this.statusEmitter.fire({ state: 'offline', detail });
+        return;
+      }
+      if (aliveMs >= RECONNECT_STABLE_MS) {
+        // 这次连接稳定存活过，退避重新从 1s 开始
+        this.reconnectAttempt = 0;
+      }
+      this.scheduleReconnect(detail);
     });
   }
 
-  /** 关闭码 → 界面文案；本扩展不做自动重连，因此文案必须给出下一步动作 */
-  private describeClose(code: number, reasonText: string): string {
-    const suffix = reasonText ? `（中继说明：${reasonText}）` : '';
+  /** 关闭码 → 界面文案（自动重连的倒计时由 scheduleReconnect 追加） */
+  private describeClose(code: number, reasonText: string, opened: boolean, lastError: string): string {
     if (code === 4008) {
       return `扩展版本（${this.store.extensionVersion || '未知'}）未通过中继版本门禁：${reasonText || '版本不一致'}。请升级扩展或联系管理员升级中继，然后点「保存并应用」`;
     }
+    if (code === 1005 || code === 1006) {
+      // 这两种码分两种情况：连握手都没成功，和连上之后被掐断（网络 / 隧道抖动）
+      const local = lastError ? `：${lastError}` : '';
+      return opened
+        ? `与中继的连接被中断（网络抖动或隧道掉线${local}）`
+        : `无法连接中继服务器（请检查中继地址、网络，以及中继是否在运行${local}）`;
+    }
     const mapped = CLOSE_REASON_TEXT[code];
     if (mapped) {
-      return `${mapped}${suffix}`;
+      return reasonText ? `${mapped}（中继说明：${reasonText}）` : mapped;
     }
-    if (code === 1005 || code === 1006) {
-      return `无法连接中继服务器（请检查中继地址、网络，以及中继是否在运行），点「重试连接」再次尝试`;
+    return `与中继服务器的连接已断开（关闭码 ${code}）${reasonText ? `（中继说明：${reasonText}）` : ''}`;
+  }
+
+  /** 取消待执行的重连（手动断开、重新连接时调用） */
+  private cancelReconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
     }
-    return `与中继服务器的连接已断开（关闭码 ${code}），点「重试连接」再次尝试${suffix}`;
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = undefined;
+    }
+  }
+
+  /**
+   * 安排下一次自动重连：指数退避（1s→30s）+ ±20% 抖动，并把倒计时同步到界面状态。
+   * 中继 4005（id 被另一个窗口占用）也会走这里：旧连接最多要几十秒才被中继判定失联。
+   */
+  private scheduleReconnect(reason: string): void {
+    if (!this.running || this.reconnectTimer) {
+      return;
+    }
+    this.reconnectAttempt += 1;
+    const step = Math.min(RECONNECT_BASE_MS * 2 ** (this.reconnectAttempt - 1), RECONNECT_MAX_MS);
+    const delay = Math.max(500, Math.round(step * (1 + RECONNECT_JITTER * (Math.random() * 2 - 1))));
+    const seconds = Math.max(1, Math.round(delay / 1000));
+    log(`[relay] ${seconds}s 后自动重连（第 ${this.reconnectAttempt} 次）：${reason}`);
+    this.statusEmitter.fire({
+      state: 'offline',
+      detail: `${reason}；${seconds}s 后自动重连（第 ${this.reconnectAttempt} 次）`,
+    });
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.connect().catch(err => logError('[relay] 重连失败', err));
+    }, delay);
   }
 
   private handleRaw(data: RawData): void {

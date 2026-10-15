@@ -169,7 +169,9 @@ if command -v curl >/dev/null 2>&1; then
 fi
 echo
 echo "安装完成。客户端「连接 → 中继模式」填写："
-echo "  地址 ws://<本机可达 IP>:${port}    密码见 sudo cat $ENV_FILE"
+echo "  地址 ws://<本机可达 IP>:${port}   （本机内网地址：$(hostname -I 2>/dev/null | awk '{print $1}')，局域网直连用）"
+echo "       跨网络经隧道 / 反向代理时填 wss://<你的域名>；两种接入方式共享同一份在线名单"
+echo "  密码见 sudo cat $ENV_FILE"
 echo "  管理令牌（可选，用于踢出/封禁/管理所有房间）见同一文件；不使用可留空。"
 echo "  注意：扩展版本必须与本中继版本一致（$(norm_version "${repo_version:-见 package.json}")，-testN / -testN.M 测试包后缀会被忽略），否则中继会拒绝接入（4008）。"
 echo "若本机只应经反向代理 / 隧道对外，请把 $ENV_FILE 里的 HOST 改为 127.0.0.1 后重启服务。"

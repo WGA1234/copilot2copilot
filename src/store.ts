@@ -26,19 +26,27 @@ export interface RelayRecord {
   lastUsedAt: number;
 }
 
-/** 中继地址归一化：去空白、去结尾斜杠、协议与主机名小写（用于去重与令牌分键） */
+/**
+ * 中继地址归一化：去空白、去结尾斜杠、协议与主机名小写（用于去重与令牌分键）。
+ * 顺手兼容两种常见写法：只写内网 IP / 域名（192.168.5.20:8787）自动补 ws://；
+ * 粘贴 http(s):// 也转成 ws(s)://（客户端自己会拼 /ws，重复的结尾 /ws 一并去掉）。
+ */
 export function normalizeRelayUrl(url: string): string {
-  const trimmed = (url ?? '').trim().replace(/\/+$/, '');
+  let trimmed = (url ?? '').trim();
   if (!trimmed) {
     return '';
   }
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    trimmed = `ws://${trimmed}`;
+  }
   try {
     const parsed = new URL(trimmed);
-    parsed.protocol = parsed.protocol.toLowerCase();
+    parsed.protocol = parsed.protocol.toLowerCase().replace(/^http/, 'ws');
     parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/ws$/i, '');
     return parsed.toString().replace(/\/+$/, '');
   } catch {
-    return trimmed;
+    return trimmed.replace(/\/+$/, '');
   }
 }
 
