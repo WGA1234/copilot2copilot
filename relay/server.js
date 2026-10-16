@@ -17,8 +17,14 @@
  *
  * 端点：/  存活文本；/healthz  JSON 状态（含中继版本与协议号，不含任何 id）
  *       /peers  在线 id 列表（需令牌），供客户端连接前自查 id 是否被占用
+ * 接入方式：隧道 / 反向代理（wss://relay.example.com）与**局域网直连**（ws://<内网 IP>:PORT）
+ *       同时可用——监听 0.0.0.0 时两者共享同一份在线名单、房间与离线队列；内网直连为明文，
+ *       仅建议在可信内网使用（同样受令牌与版本门禁约束）。启动日志会打印可用的局域网地址。
  * 版本门禁：客户端须在握手头 x-client-version 上报扩展版本（-testN / -testN.M 后缀忽略），
  *       与中继 RELAY_VERSION 不一致即拒绝（4008）——中继与扩展必须同步升级。
+ * 关闭码：4001 令牌不正确；4002 未声明 id；4003 id 为保留地址 server；4005 同 id 已被在线连接占用
+ *       （不做顶替，旧连接失去心跳后由新连接接管）；4006 被管理员踢出；4007 被封禁；4008 版本门禁；
+ *       1001 服务关闭；1011 心跳超时（先发关闭帧，2s 后强杀）。客户端据此细分提示并决定是否自动重连。
  * 房间（可见域）：房间列表（名称 / 分类 / 人数 / 是否有密码）对所有设备可见，凭密码加入；
  *       成员明细仅成员与管理员可见。设备只能"看到"（presence）并只能与同房间成员通信
  *       （转发前强制校验，管理令牌不豁免）；未加入任何房间的设备与所有人互相不可见。
@@ -40,6 +46,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 
@@ -47,7 +54,7 @@ const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 
 /** 中继版本：必须与仓库 package.json 的 version 同步（发版时一起改；install.sh 会比对 /healthz 告警） */
-const RELAY_VERSION = process.env.TALK2COPILOT_RELAY_VERSION || '2026.10.10';
+const RELAY_VERSION = process.env.TALK2COPILOT_RELAY_VERSION || '2026.10.15-test1';
 /** 协议号：与扩展 src/protocol.ts 的 PROTOCOL_VERSION 对应，仅供探针展示 */
 // 协议 5：新增信任授权通道（成员上报"我授权谁对我执行写操作"，中继下发"我被谁授权"）
 const PROTOCOL = 5;
@@ -114,7 +121,15 @@ const PORT = parsePort(process.env.PORT) ?? parsePort(process.argv[2]) ?? 8787;
 const HOST = process.env.HOST || '0.0.0.0';
 const TOKEN = process.env.TALK2COPILOT_TOKEN || '';
 const OFFLINE_LIMIT = 200;
-const HEARTBEAT_MS = 10000;
+/**
+ * 心跳：每 30s ping 一次，连续 3 次（约 90s）没收到 pong 才判定对端失联。
+ * 家宽 / 4G / 隧道抖动常常会让单次 pong 迟到十几秒，一次没回就踢会把正常连接误杀
+ * （客户端会看到 1006 且必须手动重连），因此这里给足容忍；真正掉线的连接最多多占 90s。
+ */
+const HEARTBEAT_MS = 30000;
+const HEARTBEAT_MAX_MISSED = 3;
+/** 判定心跳超时后先发关闭帧（1011），这么久还没关干净就强杀 */
+const HEARTBEAT_CLOSE_GRACE_MS = 2000;
 const SHUTDOWN_GRACE_MS = 5000;
 
 /** @type {Map<string, import('ws').WebSocket>} */
@@ -170,6 +185,32 @@ function tokenMatches(header) {
 
 function remoteOf(req) {
   return req.socket?.remoteAddress || '(unknown)';
+}
+
+/** 经 Cloudflare 隧道接入时，真实客户端 IP 在 CF-Connecting-IP 头里；本地/直连时退回 socket 地址 */
+function clientIpOf(req) {
+  const cf = String(req.headers['cf-connecting-ip'] || '').trim();
+  if (cf) {
+    return cf;
+  }
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xff || remoteOf(req);
+}
+
+/**
+ * 本机可用的局域网 IPv4 地址。中继监听 0.0.0.0 时同一端口既服务隧道，也服务局域网直连
+ * （内网设备在扩展里填 ws://<这些地址>:PORT 即可），启动日志把它们打出来方便发给同事。
+ */
+function lanAddresses() {
+  const out = [];
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    for (const addr of addrs || []) {
+      if (addr.family === 'IPv4' && !addr.internal) {
+        out.push({ iface: name, url: `ws://${addr.address}:${PORT}` });
+      }
+    }
+  }
+  return out;
 }
 
 /** 离线暂存的消息总数（健康检查用；不暴露任何 id） */
@@ -1733,16 +1774,20 @@ wss.on('connection', (ws, req) => {
   const auth = req.headers.authorization || '';
   const clientVersion = String(req.headers['x-client-version'] || '');
   const adminHeader = String(req.headers['x-admin-token'] || '');
+  // 诊断用：真实客户端 IP（隧道后面 socket 对端永远是 127.0.0.1）、id 与连接建立时间
+  ws.clientIp = clientIpOf(req);
+  ws.peerId = id;
+  ws.connectedAt = Date.now();
 
   if (!tokenMatches(auth)) {
-    log('warn', '拒绝连接：令牌不正确', { ip: remoteOf(req) });
+    log('warn', '拒绝连接：令牌不正确', { ip: ws.clientIp });
     ws.close(4001, 'unauthorized');
     return;
   }
   // 版本门禁：扩展必须与中继同步升级（-testN / -testN.M 后缀忽略），否则拒绝接入
   if (normalizeVersion(clientVersion) !== normalizeVersion(RELAY_VERSION)) {
     log('warn', '拒绝连接：扩展版本与中继不一致', {
-      id, relayVersion: RELAY_VERSION, clientVersion: clientVersion || '(未上报)', ip: remoteOf(req),
+      id, relayVersion: RELAY_VERSION, clientVersion: clientVersion || '(未上报)', ip: ws.clientIp,
     });
     ws.close(4008, `version mismatch: relay ${RELAY_VERSION}`);
     return;
@@ -1754,12 +1799,12 @@ wss.on('connection', (ws, req) => {
   }
   if (id === 'server') {
     // 'server' 是档案上报的保留地址，不能同时作为设备 id，否则该设备的消息会被静默吞掉
-    log('warn', '拒绝连接：id 为保留地址', { id, ip: remoteOf(req) });
-    ws.close(4002, 'reserved id');
+    log('warn', '拒绝连接：id 为保留地址', { id, ip: ws.clientIp });
+    ws.close(4003, 'reserved id');
     return;
   }
   if (banned.has(id)) {
-    log('warn', '拒绝连接：设备已被封禁', { id, ip: remoteOf(req) });
+    log('warn', '拒绝连接：设备已被封禁', { id, ip: ws.clientIp });
     ws.close(4007, 'banned');
     return;
   }
@@ -1787,7 +1832,7 @@ wss.on('connection', (ws, req) => {
   }
   peers.set(id, ws);
   log('info', `${id} 已上线`, {
-    online: peers.size, ip: remoteOf(req), version: clientVersion || '(未上报)', admin: ws.isAdmin === true,
+    online: peers.size, ip: ws.clientIp, version: clientVersion || '(未上报)', admin: ws.isAdmin === true,
   });
   broadcastTrustState();
 
@@ -1903,13 +1948,21 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     if (peers.get(id) === ws) {
       peers.delete(id);
       // 按连接归属删除档案：被接管连接的迟到 close 不会清掉新连接的档案
       profiles.delete(id);
       trustGrants.delete(id);
-      log('info', `${id} 已离线`, { online: peers.size });
+      // 记全关闭细节：区分"客户端主动断 / 网络断 / 心跳被踢"时靠这几项
+      log('info', `${id} 已离线`, {
+        online: peers.size,
+        ip: ws.clientIp || remoteOf(req),
+        code,
+        reason: reason ? reason.toString() : '',
+        aliveSec: Math.round((Date.now() - (ws.connectedAt || Date.now())) / 1000),
+        missedHeartbeats: ws.missedHeartbeats || 0,
+      });
       if (!shuttingDown) {
         // 在场成员离线同样会改变房间摘要里的在线成员，需一并下发 room-event
         touchRooms();
@@ -1929,10 +1982,34 @@ wss.on('connection', (ws, req) => {
 
 heartbeatTimer = setInterval(() => {
   for (const ws of wss.clients) {
-    if (ws.isAlive === false) {
-      log('warn', '心跳超时，断开连接');
-      ws.terminate();
+    if (ws.readyState !== ws.OPEN) {
       continue;
+    }
+    if (ws.isAlive === false) {
+      ws.missedHeartbeats = (ws.missedHeartbeats || 0) + 1;
+      if (ws.missedHeartbeats >= HEARTBEAT_MAX_MISSED) {
+        log('warn', '心跳超时，断开连接', {
+          id: ws.peerId || '(未知)',
+          ip: ws.clientIp || '',
+          aliveSec: Math.round((Date.now() - (ws.connectedAt || Date.now())) / 1000),
+          missed: ws.missedHeartbeats,
+        });
+        // 先发关闭帧再强杀：链路其实还活着（只是 pong 迟到）时，对端能拿到 1011 而不是 1006
+        try {
+          ws.close(1011, 'heartbeat timeout');
+        } catch {
+          // 忽略：下面的兜底 terminate 负责收尾
+        }
+        const killer = setTimeout(() => {
+          if (ws.readyState !== ws.CLOSED) {
+            ws.terminate();
+          }
+        }, HEARTBEAT_CLOSE_GRACE_MS);
+        killer.unref();
+        continue;
+      }
+    } else {
+      ws.missedHeartbeats = 0;
     }
     ws.isAlive = false;
     ws.ping();
@@ -1981,4 +2058,10 @@ server.listen(PORT, HOST, () => {
     offlineLimit: OFFLINE_LIMIT,
     pid: process.pid,
   });
+  if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
+    log('info', '局域网直连地址（内网设备可填进扩展的「中继地址」）', { urls: lanAddresses() });
+  }
+  if (!TOKEN) {
+    log('warn', '未设置 TALK2COPILOT_TOKEN：任何能访问该端口的人都能接入，局域网直连 / 隧道暴露时必须设置令牌');
+  }
 });

@@ -6,8 +6,28 @@ const STATE_LABEL: Record<string, string> = {
   stopped: '未连接',
   connecting: '连接中',
   online: '已连接',
-  offline: '连接失败',
+  offline: '已断开',
 };
+
+/** 与扩展侧 normalizeRelayUrl 同一口径：补默认协议、去结尾斜杠、协议与主机小写（用于「当前」标记比对） */
+function normalizeRelay(u: string): string {
+  let text = (u ?? '').trim();
+  if (!text) {
+    return '';
+  }
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    text = `ws://${text}`;
+  }
+  try {
+    const parsed = new URL(text);
+    parsed.protocol = parsed.protocol.toLowerCase().replace(/^http/, 'ws');
+    parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/ws$/i, '');
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return text.replace(/\/+$/, '');
+  }
+}
 
 export function ConnectPage({ snap }: { snap: Snapshot }) {
   const state = snap.state;
@@ -46,8 +66,9 @@ export function ConnectPage({ snap }: { snap: Snapshot }) {
           ? <div class="banner">扩展版本（{mine}）与中继版本（{relay.version}）不一致，中继会拒绝接入。请把扩展与中继升到同一版本。</div>
           : <Hint>扩展与中继版本必须一致，否则中继拒绝接入（同一版本号、测试包除外）。</Hint>}
         <Hint>
-          连接只在两种时机发起：启动 VS Code 时自动一次（可在下面关掉），以及你点「连接 / 重试连接」时。
-          <strong>断开后不会自动重连</strong>，需要手动再点一次。
+          连接在三种时机发起：启动 VS Code 时自动一次（可在下面关掉）、你点「连接 / 重试连接」时，
+          以及断开后的<strong>自动重连</strong>——退避从 1s 增长到 30s，中继重启、网络或隧道抖动都能自己接回来。
+          点「断开连接」会停掉自动重连。
         </Hint>
       </Section>
 
@@ -56,17 +77,25 @@ export function ConnectPage({ snap }: { snap: Snapshot }) {
           中继地址
           <input
             value={snap.draft.relayUrl}
-            placeholder="wss://relay.example.com"
+            placeholder="wss://relay.example.com 或 ws://192.168.5.20:8787"
             onInput={e => updateDraft({ relayUrl: e.currentTarget.value })}
           />
         </label>
+        <Hint>
+          跨网络填 <code>wss://relay.example.com</code>；<strong>局域网直连</strong>填内网地址即可，
+          如 <code>ws://192.168.5.20:8787</code>（只写 <code>192.168.5.20:8787</code> 会自动补上 ws://）。
+          内网直连与隧道接入的设备在同一份在线名单里，可以互相通信。
+        </Hint>
+        {/^ws:\/\//i.test(state.config.relay.url) && (
+          <div class="banner">
+            当前用 ws:// 明文连接：令牌与消息在链路上不加密，只建议在可信内网使用。
+          </div>
+        )}
         {state.relays.length > 0 && (
           <div class="relay-list">
             <p class="group-title">历史中继</p>
             {state.relays.map(r => {
-              // 与扩展侧同一套归一化口径：去空白、去结尾斜杠、忽略大小写
-              const key = (u: string): string => u.trim().replace(/\/+$/, '').toLowerCase();
-              const current = key(r.url) === key(state.config.relay.url);
+              const current = normalizeRelay(r.url) === normalizeRelay(state.config.relay.url);
               return (
                 <div class="relay-item" key={r.url}>
                   <span class="relay-url" title={r.url}>{r.url}</span>
