@@ -31,8 +31,10 @@
  *       房间、分类、成员名单与禁止名单由中继管理员（管理令牌）统一维护：创建 / 改名 / 改密码 / 归类 /
  *       移出成员（进禁止名单）/ 解除禁止 / 解散；分类仅用于分组与排序，不承载任何权限。
  *       房间状态落盘到 rooms.json（systemd StateDirectory），重启保留；封禁名单落盘在 bans.json。
- * 共享记忆（memory）：房间内成员共用的可编辑事实库，中继是唯一权威存储——权限、乐观锁、词法检索
- *       与生命周期都在服务端完成；条目全员可编辑（带 revision 校验），管理员可跨房间浏览与管理。
+ * 共享记忆（memory）：房间内成员共用的可编辑事实库，中继是**唯一权威存储与下发方**——权限、范围、
+ *       乐观锁、词法检索与生命周期都在服务端完成；条目全员可编辑（带 revision 校验）。
+ *       记忆严格按房间隔离：只能读写自己加入的房间，管理员也不例外（跨房间浏览只能走 admin 的 memory-* 管理操作）。
+ *       任何变更由中继广播 memory-event 给该房间在线成员，客户端据此重新拉取——客户端不保存、不推断记忆数据。
  *       状态落盘到 memory.json，房间解散时级联删除。
  * 管理令牌：持有者可踢出 / 封禁 / 解封任意设备，并管理所有房间与分类。
  * 职责：按 to 字段路由消息；目标不在线时暂存（每目标最多 200 条）；
@@ -54,10 +56,11 @@ const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 
 /** 中继版本：必须与仓库 package.json 的 version 同步（发版时一起改；install.sh 会比对 /healthz 告警） */
-const RELAY_VERSION = process.env.TALK2COPILOT_RELAY_VERSION || '2026.10.16';
+const RELAY_VERSION = process.env.TALK2COPILOT_RELAY_VERSION || '2026.10.23';
 /** 协议号：与扩展 src/protocol.ts 的 PROTOCOL_VERSION 对应，仅供探针展示 */
+// 协议 6：记忆严格按房间隔离，并新增 memory-event（中继在记忆变更后向房间成员下发通知）
 // 协议 5：新增信任授权通道（成员上报"我授权谁对我执行写操作"，中继下发"我被谁授权"）
-const PROTOCOL = 5;
+const PROTOCOL = 6;
 /** 管理令牌：为空时管理功能整体不可用（不给任何人管理权限） */
 const ADMIN_TOKEN = process.env.TALK2COPILOT_ADMIN_TOKEN || '';
 /** 封禁名单落盘路径：systemd 单元通过 StateDirectory 提供可写目录 */
@@ -693,8 +696,12 @@ function memoryWriteAllowed(deviceId) {
   return true;
 }
 
-/** 定位条目并校验请求者在条目所属房间中；管理员不受房间限制 */
-function memoryEntryFor(deviceId, entryId, isAdmin) {
+/**
+ * 定位条目并校验请求者在条目所属房间中。
+ * 成员侧操作（get/update/delete/restore）一律要求成员身份；管理页需要跨房间查看详情时，
+ * 通过 admin 的 memory-get 显式传 allowAdmin，成员侧接口不再保留该例外。
+ */
+function memoryEntryFor(deviceId, entryId, allowAdmin = false) {
   const entry = typeof entryId === 'string' ? memories.get(entryId) : undefined;
   if (!entry) {
     return { error: '记忆不存在' };
@@ -703,7 +710,7 @@ function memoryEntryFor(deviceId, entryId, isAdmin) {
   if (!room) {
     return { error: '记忆所属房间不存在' };
   }
-  if (!isAdmin && !room.members.has(deviceId)) {
+  if (!allowAdmin && !room.members.has(deviceId)) {
     return { error: '你不在该记忆所属的房间中' };
   }
   return { entry, room };
@@ -980,18 +987,78 @@ function handleRoomOp(ws, id, env) {
 }
 
 /**
+ * 记忆的房间范围：只认成员身份（管理员不豁免）。
+ * roomId / roomName 都允许，由中继自己解析——客户端的房间缓存可能还没收到 room-event，
+ * 不能因为本地没登记就拒绝请求（中继是权威判定方）。
+ * 两者都不给时要求"恰好加入一个房间"，避免把多个房间的记忆混在一起返回。
+ * 管理员跨房间浏览/维护走 handleAdminOp 的 memory-* 操作。
+ */
+function memoryScope(id, req) {
+  const explicitId = typeof req.roomId === 'string' ? req.roomId.trim() : '';
+  const explicitName = typeof req.roomName === 'string' ? req.roomName.trim() : '';
+  if (explicitId || explicitName) {
+    const room = findRoom({ roomId: explicitId, roomName: explicitName });
+    if (!room) {
+      return { error: '房间不存在' };
+    }
+    if (!room.members.has(id)) {
+      return { error: '你不在该房间中，无法读写该房间的共享记忆' };
+    }
+    return { room };
+  }
+  const mine = [...rooms.values()].filter(room => room.members.has(id));
+  if (mine.length === 0) {
+    return { error: '你还没有加入任何房间，无法使用共享记忆' };
+  }
+  if (mine.length > 1) {
+    return { error: '你加入了多个房间，请指定 roomId（共享记忆按房间隔离，不会跨房间混合）' };
+  }
+  return { room: mine[0] };
+}
+
+/**
+ * 记忆变更下发：中继是唯一的下发方——变更后只把"哪个房间的哪条记忆变了"通知给该房间的在线成员，
+ * 成员客户端据此重新向中继拉取权威数据。事件不含正文，避免在客户端形成第二份权威副本。
+ */
+function broadcastMemoryEvent(room, action, entry, by) {
+  if (!room) {
+    return;
+  }
+  const env = {
+    v: 1,
+    kind: 'memory-event',
+    id: `memory-${++seq}`,
+    from: 'server',
+    to: '*',
+    ts: Date.now(),
+    op: action,
+    payload: {
+      roomId: room.id,
+      roomName: room.name,
+      entryId: entry ? entry.id : '',
+      revision: entry ? entry.revision : 0,
+      by: by || '',
+    },
+  };
+  const text = JSON.stringify(env);
+  for (const member of room.members) {
+    const ws = peers.get(member);
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(text);
+    }
+  }
+}
+
+/**
  * 成员侧记忆操作：list / get / query / remember / update / delete / restore。
  * 记忆由中继托管：房间成员身份、乐观锁、容量与限流都在这里校验；
  * 管理员的管理操作（memory-*）在 handleAdminOp 中。
  */
 function handleMemoryOp(ws, id, env) {
-  const isAdmin = ws.isAdmin === true;
   const op = typeof env.op === 'string' ? env.op : '';
   const req = env.payload && typeof env.payload === 'object' ? env.payload : {};
   const fail = (error, payload) => controlResult(ws, env, 'memory', false, payload, error);
   const ok = payload => controlResult(ws, env, 'memory', true, payload);
-  /** 我能看到的房间：成员身份为准；管理员不限 */
-  const myRooms = () => [...rooms.values()].filter(room => isAdmin || room.members.has(id));
   /** 写入限流（只在实际发生写入前调用） */
   const rateLimited = () => {
     if (memoryWriteAllowed(id)) {
@@ -1002,15 +1069,12 @@ function handleMemoryOp(ws, id, env) {
   };
   switch (op) {
     case 'list': {
-      const room = typeof req.roomId === 'string' ? rooms.get(req.roomId) : undefined;
-      if (!room) {
-        fail('房间不存在');
+      const scope = memoryScope(id, req);
+      if (scope.error) {
+        fail(scope.error);
         return;
       }
-      if (!isAdmin && !room.members.has(id)) {
-        fail('你不在该房间中');
-        return;
-      }
+      const { room } = scope;
       const includeDeleted = req.includeDeleted === true;
       const limit = Math.min(Math.max(Number(req.limit) || 50, 1), 100);
       const offset = Math.max(Number(req.cursor) || 0, 0);
@@ -1028,7 +1092,8 @@ function handleMemoryOp(ws, id, env) {
       return;
     }
     case 'get': {
-      const found = memoryEntryFor(id, req.entryId, isAdmin);
+      // 成员侧接口一律以成员身份为准；管理页的跨房间详情走 admin 的 memory-get
+      const found = memoryEntryFor(id, req.entryId);
       if (found.error) {
         fail(found.error);
         return;
@@ -1042,39 +1107,24 @@ function handleMemoryOp(ws, id, env) {
         fail('query 不能为空');
         return;
       }
-      let scope;
-      if (typeof req.roomId === 'string' && req.roomId) {
-        const room = rooms.get(req.roomId);
-        if (!room) {
-          fail('房间不存在');
-          return;
-        }
-        if (!isAdmin && !room.members.has(id)) {
-          fail('你不在该房间中');
-          return;
-        }
-        scope = [room];
-      } else {
-        scope = myRooms();
-        if (scope.length === 0) {
-          fail('你还没有加入任何房间，无法查询共享记忆');
-          return;
-        }
+      const scope = memoryScope(id, req);
+      if (scope.error) {
+        fail(scope.error);
+        return;
       }
+      const { room } = scope;
       const topK = Math.min(Math.max(Number(req.topK) || 5, 1), 20);
       const tokens = memoryTokens(rawQuery);
       const hits = [];
       if (tokens.length > 0) {
-        for (const room of scope) {
-          for (const entryId of memoryByRoom.get(room.id) || []) {
-            const entry = memories.get(entryId);
-            if (!entry || entry.deleted) {
-              continue;
-            }
-            const score = scoreMemory(entry, tokens, rawQuery);
-            if (score > 0) {
-              hits.push({ entry, score });
-            }
+        for (const entryId of memoryByRoom.get(room.id) || []) {
+          const entry = memories.get(entryId);
+          if (!entry || entry.deleted) {
+            continue;
+          }
+          const score = scoreMemory(entry, tokens, rawQuery);
+          if (score > 0) {
+            hits.push({ entry, score });
           }
         }
       }
@@ -1082,35 +1132,23 @@ function handleMemoryOp(ws, id, env) {
       const top = hits.slice(0, topK);
       ok({
         query: rawQuery,
-        searchedRooms: scope.length,
+        roomId: room.id,
+        roomName: room.name,
+        searchedRooms: 1,
         results: top.map(item => ({ ...memoryView(item.entry), score: Number(item.score.toFixed(3)) })),
         ...(top.length === 0
-          ? { hint: '没有相关记忆，可正常向同事提问；拿到答复后再用 remember 记下来。' }
+          ? { hint: `房间「${room.name}」没有相关记忆，可正常向同事提问；拿到答复后再用 remember 记下来。` }
           : {}),
       });
       return;
     }
     case 'remember': {
-      const explicitRoomId = typeof req.roomId === 'string' ? req.roomId : '';
-      let room;
-      if (explicitRoomId) {
-        room = rooms.get(explicitRoomId);
-        if (!room) {
-          fail('房间不存在');
-          return;
-        }
-      } else {
-        const mine = myRooms();
-        if (mine.length !== 1) {
-          fail(mine.length === 0 ? '你还没有加入任何房间' : '你加入了多个房间，remember 必须指定 roomId');
-          return;
-        }
-        [room] = mine;
-      }
-      if (!isAdmin && !room.members.has(id)) {
-        fail('你不在该房间中');
+      const scope = memoryScope(id, req);
+      if (scope.error) {
+        fail(scope.error);
         return;
       }
+      const { room } = scope;
       const text = String(req.text || '').trim();
       if (!text) {
         fail('text 不能为空');
@@ -1164,11 +1202,12 @@ function handleMemoryOp(ws, id, env) {
       memoryIndexAdd(entry);
       saveMemory();
       log('info', `${id} 写入记忆`, { entryId: entry.id, roomId: room.id, chars: text.length, tags: tags.length });
+      broadcastMemoryEvent(room, 'created', entry, id);
       ok({ entry: memoryView(entry), duplicated: false });
       return;
     }
     case 'update': {
-      const found = memoryEntryFor(id, req.entryId, isAdmin);
+      const found = memoryEntryFor(id, req.entryId);
       if (found.error) {
         fail(found.error);
         return;
@@ -1214,11 +1253,12 @@ function handleMemoryOp(ws, id, env) {
       entry.updatedAt = Date.now();
       saveMemory();
       log('info', `${id} 更新记忆`, { entryId: entry.id, roomId: room.id, revision: entry.revision });
+      broadcastMemoryEvent(room, 'updated', entry, id);
       ok({ entry: memoryView(entry) });
       return;
     }
     case 'delete': {
-      const found = memoryEntryFor(id, req.entryId, isAdmin);
+      const found = memoryEntryFor(id, req.entryId);
       if (found.error) {
         fail(found.error);
         return;
@@ -1238,11 +1278,12 @@ function handleMemoryOp(ws, id, env) {
       entry.deleted = { by: id, at: Date.now() };
       saveMemory();
       log('info', `${id} 删除记忆（软删）`, { entryId: entry.id, roomId: room.id });
+      broadcastMemoryEvent(room, 'deleted', entry, id);
       ok({ entry: memoryView(entry) });
       return;
     }
     case 'restore': {
-      const found = memoryEntryFor(id, req.entryId, isAdmin);
+      const found = memoryEntryFor(id, req.entryId);
       if (found.error) {
         fail(found.error);
         return;
@@ -1258,6 +1299,7 @@ function handleMemoryOp(ws, id, env) {
       delete entry.deleted;
       saveMemory();
       log('info', `${id} 恢复记忆`, { entryId: entry.id, roomId: room.id });
+      broadcastMemoryEvent(room, 'restored', entry, id);
       ok({ entry: memoryView(entry) });
       return;
     }
@@ -1268,7 +1310,7 @@ function handleMemoryOp(ws, id, env) {
 
 /** 管理操作：设备 list / kick / ban / unban；房间与分类 room-create / room-update / room-kick /
  *  room-unblock / room-dissolve / category-create / category-rename / category-delete；
- *  记忆 memory-list / memory-update / memory-restore / memory-purge / memory-stats（需要管理令牌通过） */
+ *  记忆 memory-get / memory-list / memory-update / memory-restore / memory-purge / memory-stats（需要管理令牌通过） */
 function handleAdminOp(ws, id, env) {
   const op = typeof env.op === 'string' ? env.op : '';
   const req = env.payload && typeof env.payload === 'object' ? env.payload : {};
@@ -1564,6 +1606,16 @@ function handleAdminOp(ws, id, env) {
       touchRooms();
       return;
     }
+    case 'memory-get': {
+      // 管理页专用：允许跨房间按 entryId 查看详情（成员侧 memory get 不豁免）
+      const found = memoryEntryFor(id, req.entryId, true);
+      if (found.error) {
+        fail(found.error);
+        return;
+      }
+      controlResult(ws, env, 'admin', true, { entry: memoryView(found.entry, { withHistory: true }) });
+      return;
+    }
     case 'memory-list': {
       const roomId = typeof req.roomId === 'string' ? req.roomId : '';
       const keyword = String(req.q || '').trim().toLowerCase();
@@ -1608,7 +1660,7 @@ function handleAdminOp(ws, id, env) {
         fail(found.error);
         return;
       }
-      const { entry } = found;
+      const { entry, room } = found;
       const nextText = req.text === undefined ? entry.text : String(req.text).trim();
       if (!nextText || nextText.length > MEMORY_TEXT_MAX) {
         fail(`正文需为 1~${MEMORY_TEXT_MAX} 字符`);
@@ -1635,6 +1687,7 @@ function handleAdminOp(ws, id, env) {
       delete entry.deleted; // 管理员编辑即视为恢复
       saveMemory();
       log('warn', `管理员 ${id} 强制更新记忆`, { entryId: entry.id, revision: entry.revision });
+      broadcastMemoryEvent(room, 'updated', entry, id);
       controlResult(ws, env, 'admin', true, { entry: memoryView(entry) });
       return;
     }
@@ -1644,7 +1697,7 @@ function handleAdminOp(ws, id, env) {
         fail(found.error);
         return;
       }
-      const { entry } = found;
+      const { entry, room } = found;
       const targetRevision = req.revision === undefined ? undefined : Number(req.revision);
       if (targetRevision !== undefined) {
         const version = entry.history.find(item => item.revision === targetRevision);
@@ -1669,6 +1722,7 @@ function handleAdminOp(ws, id, env) {
       entry.updatedAt = Date.now();
       saveMemory();
       log('warn', `管理员 ${id} 恢复记忆`, { entryId: entry.id, revision: entry.revision, rollback: targetRevision });
+      broadcastMemoryEvent(room, 'restored', entry, id);
       controlResult(ws, env, 'admin', true, { entry: memoryView(entry) });
       return;
     }
@@ -1679,9 +1733,11 @@ function handleAdminOp(ws, id, env) {
           fail('记忆不存在');
           return;
         }
+        const room = rooms.get(entry.roomId);
         memoryIndexRemove(entry.id);
         saveMemory();
         log('warn', `管理员 ${id} 彻底删除记忆`, { entryId: entry.id, roomId: entry.roomId });
+        broadcastMemoryEvent(room, 'purged', entry, id);
         controlResult(ws, env, 'admin', true, { entryId: entry.id });
         return;
       }
@@ -1698,6 +1754,9 @@ function handleAdminOp(ws, id, env) {
       const removed = purgeRoomMemories(roomId);
       saveMemory();
       log('warn', `管理员 ${id} 清空房间记忆`, { roomId, room: room ? room.name : '', removed });
+      if (room) {
+        broadcastMemoryEvent(room, 'purged', null, id);
+      }
       controlResult(ws, env, 'admin', true, { roomId, removed });
       return;
     }

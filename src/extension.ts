@@ -107,6 +107,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           void vscode.window.showWarningMessage(`Copilot2Copilot：消息未送达——${env.error ?? '被中继拒绝'}`);
         }
       }),
+      // 中继下发记忆变更：命中界面正在查看的房间时重新拉取（数据始终以中继为准）
+      transport.onMemoryEvent(change => panel.onMemoryChanged(change)),
       transport.onStatus(s => {
         log(`状态：${s.state} · ${s.detail}`);
         status = s;

@@ -16,12 +16,28 @@ export interface ControlResult {
   env?: MessageEnvelope;
 }
 
+/**
+ * 中继下发的共享记忆变更通知（memory-event）。
+ * 只带定位信息、不带正文：客户端据此重新向中继拉取权威数据，不维护本地副本。
+ */
+export interface MemoryChange {
+  roomId: string;
+  roomName: string;
+  /** created | updated | deleted | restored | purged */
+  action: string;
+  entryId: string;
+  revision: number;
+  by: string;
+}
+
 /** 通信通道统一抽象（当前实现为中继转发） */
 export interface Transport {
   readonly onMessage: Event<MessageEnvelope>;
   readonly onStatus: Event<TransportStatus>;
   /** 中继拒收回执：原消息 id 在 refId，原因在 error（如与目标没有共同房间） */
   readonly onRejected: Event<MessageEnvelope>;
+  /** 中继下发的共享记忆变更通知（变更后重新向中继拉取，客户端不保存记忆数据） */
+  readonly onMemoryEvent: Event<MemoryChange>;
   start(): Promise<void>;
   stop(): Promise<void>;
   /** 发送一条消息；连接不可用时入本地队列稍后重试 */
