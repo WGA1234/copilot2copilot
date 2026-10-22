@@ -32,7 +32,8 @@ ProtectControlGroups=yes
 RestrictNamespaces=yes
 LockPersonality=yes
 # 必须包含 AF_NETLINK：os.networkInterfaces()（启动时打印局域网地址）经 getifaddrs/netlink
-# 枚举网卡，缺少该地址族时 libuv 返回 ENOTSUP（errno 97），进程会在启动阶段直接退出。
+# 枚举网卡，缺少该地址族时 libuv 返回 EAFNOSUPPORT（errno 97，Node 报 ERR_SYSTEM_ERROR），
+# 进程会在启动阶段直接退出。
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 CapabilityBoundingSet=
 AmbientCapabilities=

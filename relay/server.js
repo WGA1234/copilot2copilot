@@ -207,8 +207,9 @@ function lanAddresses() {
   try {
     ifaces = os.networkInterfaces();
   } catch (err) {
-    // 受限沙箱（例如 unit 缺少 AF_NETLINK）下枚举网卡会抛 ENOTSUP（errno 97）。
-    // 这只是启动日志里的诊断信息，不应让整个中继启动失败。
+    // 受限沙箱（例如 unit 缺少 AF_NETLINK）下枚举网卡会抛 EAFNOSUPPORT
+    // （errno 97，Node 报 ERR_SYSTEM_ERROR）。这只是启动日志里的诊断信息，
+    // 不应让整个中继启动失败。
     log('warn', '无法枚举本机网卡，跳过局域网地址提示', { error: err.message });
     return out;
   }
@@ -2068,7 +2069,12 @@ server.listen(PORT, HOST, () => {
     pid: process.pid,
   });
   if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
-    log('info', '局域网直连地址（内网设备可填进扩展的「中继地址」）', { urls: lanAddresses() });
+    // 枚举失败或没有非环回 IPv4 时返回空数组：不再打印一条 "urls":[] 的 INFO，
+    // 避免与前面的降级 WARN 语义矛盾
+    const urls = lanAddresses();
+    if (urls.length > 0) {
+      log('info', '局域网直连地址（内网设备可填进扩展的「中继地址」）', { urls });
+    }
   }
   if (!TOKEN) {
     log('warn', '未设置 TALK2COPILOT_TOKEN：任何能访问该端口的人都能接入，局域网直连 / 隧道暴露时必须设置令牌');

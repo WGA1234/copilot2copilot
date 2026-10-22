@@ -3,7 +3,8 @@
  *   node relay/test/deploy-unit-test.mjs
  *
  * Issue #13：unit 的 RestrictAddressFamilies 缺少 AF_NETLINK 时，启动阶段的
- * os.networkInterfaces() 会因 netlink 被屏蔽而抛 ENOTSUP（errno 97），中继启动即崩。
+ * os.networkInterfaces() 会因 netlink 被屏蔽而抛 EAFNOSUPPORT（errno 97，
+ * Node 报 ERR_SYSTEM_ERROR），中继启动即崩。
  * 这里钉住模板与安装脚本，防止再次漏掉该地址族。
  */
 import assert from 'node:assert/strict';
