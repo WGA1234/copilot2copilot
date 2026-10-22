@@ -29,31 +29,50 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
   const [editing, setEditing] = useState<{ id: string; revision: number; text: string; tags: string } | null>(null);
   const appendRef = useRef(false);
 
-  // 默认选中第一个已加入的房间
+  // 默认选中第一个已加入的房间；当前选中的房间已退出/被解散时回落到第一个
   useEffect(() => {
-    if (!roomId && joinedRooms.length > 0) {
+    const known = joinedRooms.some(room => room.id === roomId);
+    if ((!roomId || !known) && joinedRooms.length > 0) {
       setRoomId(joinedRooms[0].id);
+    }
+    if (joinedRooms.length === 0 && roomId) {
+      setRoomId('');
     }
   }, [joinedRooms, roomId]);
 
   // 订阅中继返回的记忆数据（列表 / 检索 / 增删改后的刷新）
   useEffect(() => onMemoryState(msg => {
-    if (msg.mode === 'list' && msg.roomId && msg.roomId !== roomId) {
-      return; // 忽略其它房间的迟到响应
+    // 只接受当前房间的响应：切房间时在途的旧响应直接丢弃，避免把别的房间条目显示到当前房间下
+    if (msg.roomId && msg.roomId !== roomId) {
+      return;
     }
     setLoading(false);
-    setError(msg.error ?? '');
+    const nextError = msg.error ?? '';
+    setError(nextError);
     setMode(msg.mode);
+    if (nextError) {
+      // 失败时清空列表：宁可显示为空，也不把上一个房间的内容留在当前房间下
+      setEntries([]);
+      setTotal(0);
+      setNextCursor('');
+      appendRef.current = false;
+      return;
+    }
     setEntries(prev => (msg.mode === 'search' || !appendRef.current ? msg.entries : [...prev, ...msg.entries]));
     appendRef.current = false;
     setTotal(msg.total);
     setNextCursor(msg.nextCursor);
   }), [roomId]);
 
-  // 房间 / 回收站切换时重新拉取
+  // 房间 / 回收站切换时先清空旧房间内容，再重新拉取
   useEffect(() => {
+    setEntries([]);
+    setTotal(0);
+    setNextCursor('');
+    setError('');
+    setMode('list');
+    appendRef.current = false;
     if (roomId) {
-      appendRef.current = false;
       setLoading(true);
       post({ type: 'memoryList', roomId, includeDeleted });
     }
@@ -175,6 +194,7 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
           )}
         <Hint>
           房间内所有成员共享这份记忆、也都可以修改：向同事提问前 Copilot 会先检索这里，避免重复问答；修改保留历史版本。
+          记忆<strong>严格按房间隔离</strong>，切换房间不会串到其他房间；内容与检索结果都以中继为准，其他成员修改后会自动刷新。
           删除是<strong>软删除</strong>——勾选上方「含回收站」可以查看并恢复。
         </Hint>
         {error && <div class="banner">{error}</div>}

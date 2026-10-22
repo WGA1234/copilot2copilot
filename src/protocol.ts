@@ -4,11 +4,12 @@
  */
 
 /**
- * 协议版本：v5 新增信任授权（成员上报"我授权谁对我执行写操作"，中继下发"我被谁授权"）；
+ * 协议版本：v6 记忆严格按房间隔离，中继新增 memory-event 变更下发；
+ * v5 新增信任授权（成员上报"我授权谁对我执行写操作"，中继下发"我被谁授权"）；
  * v4 新增房间共享记忆（成员 query/remember/update/delete/restore，管理员 memory-*）；
  * v3 起房间由中继管理员统一维护并落盘。中继按扩展版本号做接入门禁（本文件改动时需同步 relay/server.js）
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** 文件通道：单个文件大小上限与分块大小（512 KiB 经 base64 约 683 KiB，低于中继 2 MiB 的单帧上限） */
 export const FILE_MAX_BYTES = 64 * 1024 * 1024;
@@ -105,7 +106,7 @@ export interface AdminDevice {
 
 export type MessageKind = 'hello' | 'message' | 'reply' | 'presence' | 'offline'
   | 'file-offer' | 'file-chunk' | 'file-ack' | 'file-end' | 'file-done'
-  | 'room' | 'admin' | 'room-event' | 'memory' | 'trust' | 'error';
+  | 'room' | 'admin' | 'room-event' | 'memory' | 'memory-event' | 'trust' | 'error';
 
 export interface MessageEnvelope {
   v: number;
@@ -190,5 +191,6 @@ export function isEnvelope(value: unknown): value is MessageEnvelope {
   return typeof e.id === 'string' && typeof e.from === 'string' && typeof e.to === 'string'
     && (e.kind === 'hello' || e.kind === 'message' || e.kind === 'reply' || e.kind === 'presence' || e.kind === 'offline'
       || e.kind === 'file-offer' || e.kind === 'file-chunk' || e.kind === 'file-ack' || e.kind === 'file-end' || e.kind === 'file-done'
-      || e.kind === 'room' || e.kind === 'admin' || e.kind === 'room-event' || e.kind === 'memory' || e.kind === 'trust' || e.kind === 'error');
+      || e.kind === 'room' || e.kind === 'admin' || e.kind === 'room-event' || e.kind === 'memory'
+      || e.kind === 'memory-event' || e.kind === 'trust' || e.kind === 'error');
 }

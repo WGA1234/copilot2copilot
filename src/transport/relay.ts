@@ -5,7 +5,7 @@ import { RawData, WebSocket } from 'ws';
 import { log, logError } from '../logger';
 import { isEnvelope, makeEnvelope, MessageEnvelope } from '../protocol';
 import { colleagueEnabled, Store } from '../store';
-import { ControlResult, Transport, TransportStatus } from './types';
+import { ControlResult, MemoryChange, Transport, TransportStatus } from './types';
 
 /** 控制面请求（房间 / 管理）的应答超时 */
 const CONTROL_TIMEOUT_MS = 8000;
@@ -57,6 +57,8 @@ export class RelayTransport implements Transport {
   readonly onStatus = this.statusEmitter.event;
   private readonly rejectedEmitter = new vscode.EventEmitter<MessageEnvelope>();
   readonly onRejected = this.rejectedEmitter.event;
+  private readonly memoryEventEmitter = new vscode.EventEmitter<MemoryChange>();
+  readonly onMemoryEvent = this.memoryEventEmitter.event;
 
   private ws?: WebSocket;
   private queue: MessageEnvelope[] = [];
@@ -453,6 +455,25 @@ export class RelayTransport implements Transport {
       } else {
         log(`[relay] 收到未匹配的控制面应答（op=${parsed.op ?? '(空)'}），已忽略`);
       }
+      return;
+    }
+    if (parsed.kind === 'memory-event') {
+      // 中继是记忆的唯一权威存储与下发方：这里只接收"哪条记忆变了"，随后由界面重新向中继拉取
+      const payload = parsed.payload ?? {};
+      const roomId = typeof payload.roomId === 'string' ? payload.roomId : '';
+      if (!roomId) {
+        return;
+      }
+      const change: MemoryChange = {
+        roomId,
+        roomName: typeof payload.roomName === 'string' ? payload.roomName : '',
+        action: typeof parsed.op === 'string' ? parsed.op : '',
+        entryId: typeof payload.entryId === 'string' ? payload.entryId : '',
+        revision: Number(payload.revision) || 0,
+        by: typeof payload.by === 'string' ? payload.by : '',
+      };
+      log(`[relay] 记忆变更：房间 ${change.roomName || change.roomId} ${change.action}（条目 ${change.entryId || '(整房)'}）`);
+      this.memoryEventEmitter.fire(change);
       return;
     }
     if (parsed.kind === 'room-event') {

@@ -4,7 +4,7 @@ import { log, showLogs } from './logger';
 import { AdminMemoryFilters, AdminMemoryRoomStats, PanelState } from './panelTypes';
 import { ColleagueProfile, MemoryEntry, RoomCategory, RoomSummary } from './protocol';
 import { AppConfig, ColleagueConfig, HistoryItem, Store } from './store';
-import { ControlResult, TransportStatus } from './transport/types';
+import { ControlResult, MemoryChange, TransportStatus } from './transport/types';
 
 interface PanelDeps {
   getStatus(): TransportStatus;
@@ -60,6 +60,11 @@ function memoryCsv(entries: MemoryEntry[]): string {
 export class ConsolePanel {
   private panel?: vscode.WebviewPanel;
   private refreshTimer?: ReturnType<typeof setInterval>;
+  /**
+   * 记忆页当前查看的房间（含回收站开关）。
+   * 中继下发 memory-event 时若命中这个房间，就重新向中继拉取——界面不自行推断记忆内容。
+   */
+  private memoryView?: { roomId: string; includeDeleted: boolean };
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -155,6 +160,9 @@ export class ConsolePanel {
 
   /** 拉取记忆列表并推送给界面（打开面板 / 增删改后刷新都走这里） */
   private async pushMemoryList(roomId: string, cursor?: string, includeDeleted = false): Promise<void> {
+    if (roomId && !cursor) {
+      this.memoryView = { roomId, includeDeleted };
+    }
     const result = await this.deps.control('memory', 'list', {
       roomId,
       limit: 50,
@@ -162,6 +170,18 @@ export class ConsolePanel {
       ...(includeDeleted ? { includeDeleted: true } : {}),
     });
     this.sendMemoryState(roomId, 'list', result);
+  }
+
+  /**
+   * 中继下发记忆变更：只有当前正在查看的房间才需要重新拉取。
+   * 数据本身仍从中继取——客户端不保存记忆、也不根据事件自行拼接内容。
+   */
+  onMemoryChanged(change: MemoryChange): void {
+    const view = this.memoryView;
+    if (!this.panel || !view || view.roomId !== change.roomId) {
+      return;
+    }
+    void this.pushMemoryList(view.roomId, undefined, view.includeDeleted);
   }
 
   /** 记忆检索：roomId 为空时检索我加入的全部房间 */

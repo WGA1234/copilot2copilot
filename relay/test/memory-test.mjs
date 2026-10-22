@@ -164,21 +164,57 @@ try {
   const created = await adm(alice, 'room-create', { name: '记忆测试房', password: 'pw' });
   assert.equal(created.ok, true);
   const roomId = created.payload.room.id;
+  // 管理员也只是普通成员：读写记忆前必须自己加入房间（跨房间只看管理页）
+  assert.equal((await control(alice, 'room', 'join', { roomId, password: 'pw' })).ok, true);
   assert.equal((await mem(bob, 'remember', { roomId, text: 'x' })).ok, false, '未加入房间不能写记忆');
   assert.equal((await control(bob, 'room', 'join', { roomId, password: 'pw' })).ok, true);
-  ok('准备完成：alice 建房，bob 加入，carol 留在房外');
+  ok('准备完成：alice 建房并加入，bob 加入，carol 留在房外');
+
+  // ---------------- 房间隔离：管理员也不能越过成员身份 ----------------
+  const otherRoom = await adm(alice, 'room-create', { name: '隔离房' });
+  assert.equal(otherRoom.ok, true);
+  const otherRoomId = otherRoom.payload.room.id;
+  // 建房者默认是成员；退出后管理员身份也不应再获得该房记忆的读写权
+  assert.equal((await mem(alice, 'list', { roomId: otherRoomId })).ok, true, '建房者默认是成员');
+  assert.equal((await control(alice, 'room', 'leave', { roomId: otherRoomId })).ok, true);
+  assert.equal((await mem(alice, 'list', { roomId: otherRoomId })).ok, false, '管理员未加入时不能列该房记忆');
+  assert.equal((await mem(alice, 'query', { query: 'x', roomId: otherRoomId })).ok, false, '管理员未加入时不能检索该房记忆');
+  assert.equal((await mem(alice, 'remember', { roomId: otherRoomId, text: '偷写' })).ok, false, '管理员未加入时不能写该房记忆');
+  assert.equal((await adm(alice, 'memory-list', { roomId: otherRoomId })).ok, true, '管理页仍可跨房间浏览（只读管理操作）');
+  assert.equal((await mem(alice, 'list', { roomId })).ok, true, '加入后可以列自己房间的记忆');
+  // 只加入一个房间时可以不传 roomId；加入多个后必须明确指定，绝不跨房间混合
+  assert.equal((await mem(bob, 'query', { query: 'pageSize' })).ok, true, '只加入一个房间时可省略 roomId');
+  assert.equal((await control(alice, 'room', 'join', { roomId: otherRoomId })).ok, true);
+  const multiRoomQuery = await mem(alice, 'query', { query: 'pageSize' });
+  assert.equal(multiRoomQuery.ok, false, '加入多个房间时不允许省略 roomId');
+  assert.match(multiRoomQuery.error, /指定 roomId/);
+  assert.equal((await control(alice, 'room', 'leave', { roomId: otherRoomId })).ok, true);
+  ok('房间隔离：管理员不豁免；多房间必须指明 roomId；无跨房间混合检索');
 
   // ---------------- 权限：非成员不可查 / 写 ----------------
   const carolQuery = await mem(carol, 'query', { query: 'pageSize' });
   assert.equal(carolQuery.ok, false, '非成员不能查询');
   const carolWrite = await mem(carol, 'remember', { roomId, text: '偷写' });
   assert.equal(carolWrite.ok, false, '非成员不能写入');
+  // 房间可以由中继按名称解析（客户端缓存没收到 room-event 时也能工作）
+  assert.equal((await mem(bob, 'list', { roomName: '记忆测试房' })).ok, true, '按房间名解析 list');
+  assert.equal((await mem(bob, 'query', { query: 'pageSize', roomName: '记忆测试房' })).ok, true, '按房间名解析 query');
+  assert.equal((await mem(carol, 'query', { query: 'pageSize', roomName: '记忆测试房' })).ok, false, '按名称也不能越过成员身份');
+  // 客户端在本地缓存未命中时会把同一个原始值同时放进 roomId / roomName：
+  // 中继应按 id 查不到后回落到名称，并给出“不在该房间”而不是“房间不存在”
+  const carolRaw = await mem(carol, 'query', { query: 'pageSize', roomId: '记忆测试房', roomName: '记忆测试房' });
+  assert.equal(carolRaw.ok, false);
+  assert.match(carolRaw.error, /不在该房间/, '房间名作为 roomId 传递时仍应解析出名称并判定成员身份');
+  const missingRoom = await mem(bob, 'query', { query: 'pageSize', roomName: '不存在的房间' });
+  assert.equal(missingRoom.ok, false);
+  assert.match(missingRoom.error, /房间不存在/);
   const emptyQuery = await mem(bob, 'query', { query: 'pageSize', roomId });
   assert.equal(emptyQuery.ok, true);
   assert.equal(emptyQuery.payload.results.length, 0);
   ok('权限：非成员查询 / 写入被拒，成员可查询');
 
   // ---------------- 共享 + 去重 ----------------
+  const createdEvent = waitFor(bob, env => env.kind === 'memory-event' && env.op === 'created', 'bob 收到记忆变更事件');
   const first = await mem(alice, 'remember', {
     roomId,
     text: 'OrderService 的 pageSize 上限是 100，超过会截断',
@@ -186,6 +222,11 @@ try {
     sourceRequestId: 'msg-1',
   });
   assert.equal(first.ok, true);
+  const event = await createdEvent;
+  assert.equal(event.payload.roomId, roomId, 'memory-event 应带房间 id');
+  assert.equal(event.payload.entryId, first.payload.entry.id, 'memory-event 应带条目 id');
+  assert.equal(event.payload.by, 'alice', 'memory-event 应带发起人');
+  assert.equal(event.payload.text, undefined, 'memory-event 不下发正文（客户端需向中继重新拉取）');
   const entryId = first.payload.entry.id;
   assert.equal(first.payload.entry.revision, 1);
   assert.equal(first.payload.entry.author, 'alice');
@@ -323,12 +364,14 @@ try {
   // ---------------- 持久化与级联 ----------------
   const survivorRoom = await adm(alice, 'room-create', { name: '持久化房' });
   const survivorRoomId = survivorRoom.payload.room.id;
+  assert.equal((await control(alice, 'room', 'join', { roomId: survivorRoomId })).ok, true);
   const survivor = await mem(alice, 'remember', { roomId: survivorRoomId, text: '持久化验证：pageSize 上限 200' });
   const survivorId = survivor.payload.entry.id;
   await mem(alice, 'update', { entryId: survivorId, revision: 1, text: '持久化验证：pageSize 上限 300' });
 
   const cascadeRoom = await adm(alice, 'room-create', { name: '级联房' });
   const cascadeRoomId = cascadeRoom.payload.room.id;
+  assert.equal((await control(alice, 'room', 'join', { roomId: cascadeRoomId })).ok, true);
   const cascade = await mem(alice, 'remember', { roomId: cascadeRoomId, text: '级联删除验证' });
   assert.equal(cascade.ok, true);
   assert.equal((await adm(alice, 'room-dissolve', { roomId: cascadeRoomId })).ok, true);
@@ -338,7 +381,7 @@ try {
   health = await waitHealthy();
   assert.equal(health.memories, 1, '重启后应只剩持久化房的那条记忆');
   const alice2 = await connect('alice', { admin: true });
-  const survivorQuery = await mem(alice2, 'query', { query: 'pageSize 300' });
+  const survivorQuery = await mem(alice2, 'query', { query: 'pageSize 300', roomId: survivorRoomId });
   assert.equal(survivorQuery.payload.results[0].id, survivorId, '条目在重启后保持');
   assert.equal(survivorQuery.payload.results[0].revision, 2);
   const survivorDetail = await mem(alice2, 'get', { entryId: survivorId });

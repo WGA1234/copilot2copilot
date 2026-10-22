@@ -172,11 +172,18 @@ export class Injector {
     return `${peerId}（角色：${role}；负责：${scope}）`;
   }
 
-  /** 已加入房间的共享记忆总条数（用于注入提示；条数由中继随 room-event 下发） */
-  private memoryCount(): number {
-    return this.store.getRooms()
-      .filter(room => room.joined)
-      .reduce((sum, room) => sum + (room.memoryCount ?? 0), 0);
+  /**
+   * 已加入房间的共享记忆提示（条数由中继随 room-event 下发）。
+   * 记忆按房间隔离：提示里逐个列出房间与条数，提醒模型检索时用 room 参数指定房间。
+   */
+  private memoryHint(): string[] {
+    const rooms = this.store.getRooms()
+      .filter(room => room.joined && (room.memoryCount ?? 0) > 0);
+    if (rooms.length === 0) {
+      return [];
+    }
+    const detail = rooms.map(room => `${room.name} ${room.memoryCount} 条`).join('；');
+    return [`房间共享记忆（按房间隔离）：${detail}。回答前可先用 talk2copilot_query_memory 检索对应房间是否已有结论，避免重复确认。`];
   }
 
   /** 是否已加入房间（记忆按房间共享，未加入房间时不做记忆提示） */
@@ -203,9 +210,7 @@ export class Injector {
       isTask
         ? `[同事任务] 来自 ${this.profileLine(env.from)}，request_id = ${env.id}：请求本机执行一项写操作。`
         : `[同事消息] 来自 ${this.profileLine(env.from)}，request_id = ${env.id}。`,
-      ...(this.memoryCount() > 0
-        ? [`房间共享记忆现有 ${this.memoryCount()} 条：回答前可先用 talk2copilot_query_memory 检索是否已有结论，避免重复确认。`]
-        : []),
+      ...(this.memoryHint()),
       canExecute
         ? '本机用户已通过「可执行」开关授权该同事：请按附带的《通信约定（读写版）》执行任务并回报（做了什么 + 关键 diff + 验证情况）；红线操作（删除、装依赖、工作区外等）仍须拒绝。'
         : (isTask
