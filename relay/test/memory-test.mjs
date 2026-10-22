@@ -176,11 +176,17 @@ try {
   const otherRoomId = otherRoom.payload.room.id;
   // 建房者默认是成员；退出后管理员身份也不应再获得该房记忆的读写权
   assert.equal((await mem(alice, 'list', { roomId: otherRoomId })).ok, true, '建房者默认是成员');
+  const otherEntry = await mem(alice, 'remember', { roomId: otherRoomId, text: '隔离房条目：仅供管理员查看' });
+  assert.equal(otherEntry.ok, true);
+  const otherEntryId = otherEntry.payload.entry.id;
   assert.equal((await control(alice, 'room', 'leave', { roomId: otherRoomId })).ok, true);
+  assert.equal((await mem(alice, 'get', { entryId: otherEntryId })).ok, false, '管理员未加入时成员侧 get 也不能跨房间');
+  assert.equal((await adm(alice, 'memory-get', { entryId: otherEntryId })).ok, true, '管理页可跨房间查看详情');
   assert.equal((await mem(alice, 'list', { roomId: otherRoomId })).ok, false, '管理员未加入时不能列该房记忆');
   assert.equal((await mem(alice, 'query', { query: 'x', roomId: otherRoomId })).ok, false, '管理员未加入时不能检索该房记忆');
   assert.equal((await mem(alice, 'remember', { roomId: otherRoomId, text: '偷写' })).ok, false, '管理员未加入时不能写该房记忆');
   assert.equal((await adm(alice, 'memory-list', { roomId: otherRoomId })).ok, true, '管理页仍可跨房间浏览（只读管理操作）');
+  assert.equal((await adm(alice, 'memory-purge', { entryId: otherEntryId })).ok, true, '清理隔离房测试条目');
   assert.equal((await mem(alice, 'list', { roomId })).ok, true, '加入后可以列自己房间的记忆');
   // 只加入一个房间时可以不传 roomId；加入多个后必须明确指定，绝不跨房间混合
   assert.equal((await mem(bob, 'query', { query: 'pageSize' })).ok, true, '只加入一个房间时可省略 roomId');

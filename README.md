@@ -148,7 +148,7 @@ TALK2COPILOT_TOKEN=<你的密码> node relay/server.js 8787
 
 ```bash
 sudo systemctl status talk2copilot-relay    # 运行状态
-curl -s http://127.0.0.1:8787/healthz       # 探针：{"status":"ok","version":"2026.10.16","protocol":6,"peers":..,"rooms":..,"memories":..,"bans":..,"queued":..,"tokenRequired":true,"adminEnabled":true}
+curl -s http://127.0.0.1:8787/healthz       # 探针：{"status":"ok","version":"2026.10.23","protocol":6,"peers":..,"rooms":..,"memories":..,"bans":..,"queued":..,"tokenRequired":true,"adminEnabled":true}
 curl -s -H "Authorization: Bearer <密码>" http://127.0.0.1:8787/peers   # 在线 id 列表（客户端连接前会自查此接口）
 sudo journalctl -u talk2copilot-relay -f    # 日志（带时间戳与级别，可用 LOG_LEVEL 调级别）
 ```

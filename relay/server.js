@@ -698,8 +698,8 @@ function memoryWriteAllowed(deviceId) {
 
 /**
  * 定位条目并校验请求者在条目所属房间中。
- * 成员侧操作（get/update/delete/restore）一律要求成员身份；只有管理员界面需要按 entryId
- * 跨房间查看详情，此时显式传 allowAdmin——管理侧的写操作走 handleAdminOp 的 memory-*。
+ * 成员侧操作（get/update/delete/restore）一律要求成员身份；管理页需要跨房间查看详情时，
+ * 通过 admin 的 memory-get 显式传 allowAdmin，成员侧接口不再保留该例外。
  */
 function memoryEntryFor(deviceId, entryId, allowAdmin = false) {
   const entry = typeof entryId === 'string' ? memories.get(entryId) : undefined;
@@ -1055,8 +1055,6 @@ function broadcastMemoryEvent(room, action, entry, by) {
  * 管理员的管理操作（memory-*）在 handleAdminOp 中。
  */
 function handleMemoryOp(ws, id, env) {
-  // 管理员身份只在 get（管理界面查看详情）时允许跨房间；列表 / 检索 / 写入一律以成员身份为准
-  const isAdmin = ws.isAdmin === true;
   const op = typeof env.op === 'string' ? env.op : '';
   const req = env.payload && typeof env.payload === 'object' ? env.payload : {};
   const fail = (error, payload) => controlResult(ws, env, 'memory', false, payload, error);
@@ -1094,7 +1092,8 @@ function handleMemoryOp(ws, id, env) {
       return;
     }
     case 'get': {
-      const found = memoryEntryFor(id, req.entryId, isAdmin);
+      // 成员侧接口一律以成员身份为准；管理页的跨房间详情走 admin 的 memory-get
+      const found = memoryEntryFor(id, req.entryId);
       if (found.error) {
         fail(found.error);
         return;
@@ -1311,7 +1310,7 @@ function handleMemoryOp(ws, id, env) {
 
 /** 管理操作：设备 list / kick / ban / unban；房间与分类 room-create / room-update / room-kick /
  *  room-unblock / room-dissolve / category-create / category-rename / category-delete；
- *  记忆 memory-list / memory-update / memory-restore / memory-purge / memory-stats（需要管理令牌通过） */
+ *  记忆 memory-get / memory-list / memory-update / memory-restore / memory-purge / memory-stats（需要管理令牌通过） */
 function handleAdminOp(ws, id, env) {
   const op = typeof env.op === 'string' ? env.op : '';
   const req = env.payload && typeof env.payload === 'object' ? env.payload : {};
@@ -1605,6 +1604,16 @@ function handleAdminOp(ws, id, env) {
       log('warn', `管理员 ${id} 删除分类「${removed.name}」`, { categoryId: removed.id, movedRooms });
       controlResult(ws, env, 'admin', true, { categoryId: removed.id, movedRooms });
       touchRooms();
+      return;
+    }
+    case 'memory-get': {
+      // 管理页专用：允许跨房间按 entryId 查看详情（成员侧 memory get 不豁免）
+      const found = memoryEntryFor(id, req.entryId, true);
+      if (found.error) {
+        fail(found.error);
+        return;
+      }
+      controlResult(ws, env, 'admin', true, { entry: memoryView(found.entry, { withHistory: true }) });
       return;
     }
     case 'memory-list': {

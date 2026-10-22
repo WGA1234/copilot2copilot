@@ -61,10 +61,11 @@ export class ConsolePanel {
   private panel?: vscode.WebviewPanel;
   private refreshTimer?: ReturnType<typeof setInterval>;
   /**
-   * 记忆页当前查看的房间（含回收站开关）。
-   * 中继下发 memory-event 时若命中这个房间，就重新向中继拉取——界面不自行推断记忆内容。
+   * 记忆页当前查看状态（房间 / 列表或检索 / 检索词 / 回收站）。
+   * 由 webview 在页面挂载、切换时上报，离开页面或面板销毁时清空；
+   * 收到 memory-event 只刷新这个可见状态，不在后台做多余的请求。
    */
-  private memoryView?: { roomId: string; includeDeleted: boolean };
+  private memoryView?: { roomId: string; mode: 'list' | 'search'; query?: string; includeDeleted: boolean };
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -109,11 +110,14 @@ export class ConsolePanel {
 
   private attach(panel: vscode.WebviewPanel): void {
     this.panel = panel;
+    // 新页面尚未上报记忆页状态：先清空，避免沿用上一个页面的残留
+    this.memoryView = undefined;
     panel.webview.html = this.renderHtml(panel.webview, this.context.extensionUri);
     panel.webview.onDidReceiveMessage(msg => void this.handleMessage(msg), undefined, this.context.subscriptions);
     panel.onDidDispose(() => {
       if (this.panel === panel) {
         this.panel = undefined;
+        this.memoryView = undefined;
       }
       this.stopRefresh();
     }, undefined, this.context.subscriptions);
@@ -160,9 +164,6 @@ export class ConsolePanel {
 
   /** 拉取记忆列表并推送给界面（打开面板 / 增删改后刷新都走这里） */
   private async pushMemoryList(roomId: string, cursor?: string, includeDeleted = false): Promise<void> {
-    if (roomId && !cursor) {
-      this.memoryView = { roomId, includeDeleted };
-    }
     const result = await this.deps.control('memory', 'list', {
       roomId,
       limit: 50,
@@ -173,18 +174,27 @@ export class ConsolePanel {
   }
 
   /**
-   * 中继下发记忆变更：只有当前正在查看的房间才需要重新拉取。
+   * 中继下发记忆变更：只刷新当前可见的内容。
    * 数据本身仍从中继取——客户端不保存记忆、也不根据事件自行拼接内容。
+   * 自己发起的写入会由本地操作流程刷新，这里跳过，避免一次写入触发两次请求。
    */
   onMemoryChanged(change: MemoryChange): void {
     const view = this.memoryView;
     if (!this.panel || !view || view.roomId !== change.roomId) {
       return;
     }
+    if (change.by && change.by === this.store.identity.id) {
+      return;
+    }
+    if (view.mode === 'search' && view.query) {
+      // 正在看检索结果：用同一检索词重跑，而不是切回列表
+      void this.pushMemorySearch(view.roomId, view.query);
+      return;
+    }
     void this.pushMemoryList(view.roomId, undefined, view.includeDeleted);
   }
 
-  /** 记忆检索：roomId 为空时检索我加入的全部房间 */
+  /** 记忆检索：按指定房间检索（记忆按房间隔离，不支持跨房间聚合） */
   private async pushMemorySearch(roomId: string, query: string): Promise<void> {
     const result = await this.deps.control('memory', 'query', {
       query,
@@ -245,7 +255,7 @@ export class ConsolePanel {
 
   /** 管理员记忆详情（含历史版本）；取不到时让界面关闭详情 */
   private async pushAdminMemoryDetail(entryId: string): Promise<void> {
-    const result = await this.deps.control('memory', 'get', { entryId });
+    const result = await this.deps.control('admin', 'memory-get', { entryId });
     const entry = result.ok
       ? (result.env?.payload as { entry?: MemoryEntry } | undefined)?.entry
       : undefined;
@@ -336,6 +346,8 @@ export class ConsolePanel {
       roomId?: string;
       cursor?: string;
       includeDeleted?: boolean;
+      active?: boolean;
+      mode?: 'list' | 'search';
       query?: string;
       text?: string;
       tags?: string[];
@@ -356,6 +368,7 @@ export class ConsolePanel {
           break;
         }
         log('[panel] 界面请求刷新：重新注入页面');
+        this.memoryView = undefined;
         panel.webview.html = this.renderHtml(panel.webview, this.context.extensionUri);
         break;
       }
@@ -603,6 +616,21 @@ export class ConsolePanel {
         log('[panel] 已把当前档案的角色/负责内容存为模板');
         void vscode.window.showInformationMessage('Copilot2Copilot：已把当前角色与负责内容存为模板，供新工作区预填（不含 id）。');
         this.postState();
+        break;
+      }
+      case 'memoryView': {
+        // 记忆页上报可见状态；离开页面（active=false）立即清空，避免后台继续刷新
+        const roomId = String(m.roomId ?? '');
+        if (m.active !== true || !roomId) {
+          this.memoryView = undefined;
+          break;
+        }
+        this.memoryView = {
+          roomId,
+          mode: m.mode === 'search' ? 'search' : 'list',
+          ...(m.mode === 'search' && m.query ? { query: m.query } : {}),
+          includeDeleted: m.includeDeleted === true,
+        };
         break;
       }
       case 'memoryList': {

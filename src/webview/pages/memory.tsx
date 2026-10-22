@@ -21,6 +21,8 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
   const [nextCursor, setNextCursor] = useState('');
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [query, setQuery] = useState('');
+  /** 已提交的检索词（与输入框分开：输入未回车时不应影响事件刷新） */
+  const [activeQuery, setActiveQuery] = useState('');
   const [mode, setMode] = useState<'list' | 'search'>('list');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -58,6 +60,9 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
       appendRef.current = false;
       return;
     }
+    if (msg.mode === 'list') {
+      setActiveQuery('');
+    }
     setEntries(prev => (msg.mode === 'search' || !appendRef.current ? msg.entries : [...prev, ...msg.entries]));
     appendRef.current = false;
     setTotal(msg.total);
@@ -71,12 +76,33 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
     setNextCursor('');
     setError('');
     setMode('list');
+    setActiveQuery('');
     appendRef.current = false;
     if (roomId) {
       setLoading(true);
       post({ type: 'memoryList', roomId, includeDeleted });
     }
   }, [roomId, includeDeleted]);
+
+  // 把当前查看状态同步给扩展：中继事件只刷新可见内容；离开记忆页时清空
+  useEffect(() => {
+    if (!roomId) {
+      post({ type: 'memoryView', active: false });
+      return;
+    }
+    post({
+      type: 'memoryView',
+      active: true,
+      roomId,
+      mode,
+      ...(mode === 'search' && activeQuery ? { query: activeQuery } : {}),
+      includeDeleted,
+    });
+  }, [roomId, mode, activeQuery, includeDeleted]);
+
+  useEffect(() => () => {
+    post({ type: 'memoryView', active: false });
+  }, []);
 
   if (!state) {
     return null;
@@ -89,6 +115,7 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
     }
     appendRef.current = false;
     setQuery('');
+    setActiveQuery('');
     setLoading(true);
     post({ type: 'memoryList', roomId, includeDeleted });
   };
@@ -109,6 +136,7 @@ export function MemoryPage({ snap }: { snap: Snapshot }) {
       return;
     }
     appendRef.current = false;
+    setActiveQuery(value);
     setLoading(true);
     post({ type: 'memorySearch', roomId, query: value });
   };

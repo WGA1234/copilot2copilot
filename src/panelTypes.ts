@@ -118,6 +118,15 @@ export type WebviewMessage =
   | { type: 'toggleColleague'; peerId: string; enabled: boolean }
   | { type: 'saveTemplate' }
   | { type: 'memoryList'; roomId: string; cursor?: string; includeDeleted?: boolean }
+  | {
+    /** 记忆页当前查看状态：扩展据此在收到 memory-event 时只刷新可见内容；离开页面时 active=false */
+    type: 'memoryView';
+    active: boolean;
+    roomId?: string;
+    mode?: 'list' | 'search';
+    query?: string;
+    includeDeleted?: boolean;
+  }
   | { type: 'memorySearch'; roomId?: string; query: string }
   | { type: 'memoryCreate'; roomId: string; text: string; tags: string[]; includeDeleted: boolean }
   | {
