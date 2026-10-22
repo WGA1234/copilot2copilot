@@ -203,7 +203,16 @@ function clientIpOf(req) {
  */
 function lanAddresses() {
   const out = [];
-  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+  let ifaces;
+  try {
+    ifaces = os.networkInterfaces();
+  } catch (err) {
+    // 受限沙箱（例如 unit 缺少 AF_NETLINK）下枚举网卡会抛 ENOTSUP（errno 97）。
+    // 这只是启动日志里的诊断信息，不应让整个中继启动失败。
+    log('warn', '无法枚举本机网卡，跳过局域网地址提示', { error: err.message });
+    return out;
+  }
+  for (const [name, addrs] of Object.entries(ifaces)) {
     for (const addr of addrs || []) {
       if (addr.family === 'IPv4' && !addr.internal) {
         out.push({ iface: name, url: `ws://${addr.address}:${PORT}` });
